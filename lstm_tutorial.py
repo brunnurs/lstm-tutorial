@@ -148,16 +148,25 @@ class Model(object):
             cell = tf.contrib.rnn.MultiRNNCell([cell for _ in range(num_layers)], state_is_tuple=True)
 
         output, self.state = tf.nn.dynamic_rnn(cell, inputs, dtype=tf.float32, initial_state=rnn_tuple_state)
-        # reshape to (batch_size * num_steps, hidden_size)
+        # output contains the output over one batch * num_steps (20 * 35), where each value has 65 dimensions (hidden_size)
+        # self.state is the value we feed into the next batch via initial_state (except when we start a new epoch)
+
+        # we flatten down the output for the softmax to 700 * 650. (the 700 is 35 * 20, so just flatten the batches)
         output = tf.reshape(output, [-1, hidden_size])
 
+        # for the softmax we wanna know what's the probability that the output vector (650 --> hidden_size) is a
+        # specific word of the vocabular. That's why we need to have the weight-matrix 'w' and biaas 'b' with
+        # the same size as the whole dictionary (10'000 with this test-data)
         softmax_w = tf.Variable(tf.random_uniform([hidden_size, vocab_size], -init_scale, init_scale))
         softmax_b = tf.Variable(tf.random_uniform([vocab_size], -init_scale, init_scale))
+
         logits = tf.nn.xw_plus_b(output, softmax_w, softmax_b)
         # Reshape logits to be a 3-D tensor for sequence loss
         logits = tf.reshape(logits, [self.batch_size, self.num_steps, vocab_size])
 
-        # Use the contrib sequence loss and average over the batches
+        # Use the contrib sequence loss and average over the batches. Simply a cross entropy loss over all batches
+        # and the whole sequence. The third parameter is the weighting, which we don't use.
+        # See: https://www.tensorflow.org/api_docs/python/tf/contrib/seq2seq/sequence_loss
         loss = tf.contrib.seq2seq.sequence_loss(
             logits,
             self.input_obj.targets,
@@ -168,29 +177,49 @@ class Model(object):
         # Update the cost
         self.cost = tf.reduce_sum(loss)
 
-        # get the prediction accuracy
+        # get the prediction accuracy. The softmax will return probabilities for each word in vocab. NOTE: this is not
+        # the loss-function, but used to calculate the accuracy. Even though this two tasks are quite the same,
+        # it's important to note that cross entropy is a loss function whereas softmax is an activation function.
+        # See: https://www.quora.com/Is-the-softmax-loss-the-same-as-the-cross-entropy-loss/answer/Rafael-Pinto-4?share=4315878f&srid=3ibpF
         self.softmax_out = tf.nn.softmax(tf.reshape(logits, [-1, vocab_size]))
+
+        # only get the word with the highest probability, which we then use as our predicted word.
         self.predict = tf.cast(tf.argmax(self.softmax_out, axis=1), tf.int32)
         correct_prediction = tf.equal(self.predict, tf.reshape(self.input_obj.targets, [-1]))
+
+        # calculate the accuracy by reducing over all those 1 (correct prediction) and 0 (incorrect predictions) -
+        # remember, only in this one batch
         self.accuracy = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))
 
+        # the next part is kind of an optimization of a simple "out of the box optimizer". It's only done for training.
         if not is_training:
             return
+
+        # we will decrease the learning rate during training, so we need to get it here.
         self.learning_rate = tf.Variable(0.0, trainable=False)
 
         tvars = tf.trainable_variables()
+
+        # clip the gradient during back-propagation to avoid a gradient explosion. Seems to increase performance they say...
         grads, _ = tf.clip_by_global_norm(tf.gradients(self.cost, tvars), 5)
         optimizer = tf.train.GradientDescentOptimizer(self.learning_rate)
         # optimizer = tf.train.AdamOptimizer(self.learning_rate)
+
+        # here we do the gradient descend (kind of manually, with the clipped gradients from before). Not that we use the cost-value calculated before
+        # via gradients. So the train_op trains based on the calculated costs.
         self.train_op = optimizer.apply_gradients(
             zip(grads, tvars),
             global_step=tf.contrib.framework.get_or_create_global_step())
         # self.optimizer = tf.train.GradientDescentOptimizer(self.learning_rate).minimize(self.cost)
 
+        # the next 2 lines makes it possible to change the learning rate during training.
         self.new_lr = tf.placeholder(tf.float32, shape=[])
         self.lr_update = tf.assign(self.learning_rate, self.new_lr)
 
     def assign_lr(self, session, lr_value):
+        """
+        With this line we can set a new learning rate during training. We will do this at the beginning of each epoch.
+        """
         session.run(self.lr_update, feed_dict={self.new_lr: lr_value})
 
 
@@ -200,29 +229,44 @@ def train(train_data, vocabulary_size, num_layers, num_epochs, batch_size, model
     training_input = Input(batch_size=batch_size, num_steps=35, data=train_data)
     m = Model(training_input, is_training=True, hidden_size=650, vocab_size=vocabulary_size,
               num_layers=num_layers)
+
+    # needs to run after the tensorflow-graph has been created (in the constructor of the Mode())
     init_op = tf.global_variables_initializer()
     orig_decay = lr_decay
     with tf.Session() as sess:
         # start threads
         sess.run([init_op])
         coord = tf.train.Coordinator()
+        # the Coordinator/queue-runner is used in the batch_producer().
         threads = tf.train.start_queue_runners(coord=coord)
         saver = tf.train.Saver()
         for epoch in range(num_epochs):
+            # after max_lr_epoch (default 10) we start to decrease the learning rate (0.93^2, 0.93^3, 0.93^4, etc...)
             new_lr_decay = orig_decay ** max(epoch + 1 - max_lr_epoch, 0.0)
             m.assign_lr(sess, learning_rate * new_lr_decay)
             # m.assign_lr(sess, learning_rate)
             # print(m.learning_rate.eval(), new_lr_decay)
+
+            # as described above, this variable is only used to transfer the state in the RNN over multiple batches,
+            # but in the begin of every epoch we reset it.
             current_state = np.zeros((num_layers, 2, batch_size, m.hidden_size))
             curr_time = dt.datetime.now()
+
+            # iterate over all the minibatches, which are given by batch-size and num steps (20*35)
             for step in range(training_input.epoch_size):
                 # cost, _ = sess.run([m.cost, m.optimizer])
+
+                # don't print at every minibatch, but only every 50 batches.
                 if step % print_iter != 0:
+                    # we actually only run the three tf-methods referenced with m.cost, m.train_op and m.state. Remember that we use the current_state to
+                    # hand over the state of the cells between mini-batches (see the feed_dict parameter)
                     cost, _, current_state = sess.run([m.cost, m.train_op, m.state],
                                                       feed_dict={m.init_state: current_state})
                 else:
                     seconds = (float((dt.datetime.now() - curr_time).seconds) / print_iter)
                     curr_time = dt.datetime.now()
+
+                    # same as above, but we also call the m.accuracy function to calculate the accuracy. Only necessary for printing (to see the progress).
                     cost, _, current_state, acc = sess.run([m.cost, m.train_op, m.state, m.accuracy],
                                                            feed_dict={m.init_state: current_state})
                     print("Epoch {}, Step {}, cost: {:.3f}, accuracy: {:.3f}, Seconds per step: {:.3f}".format(epoch,
@@ -280,7 +324,7 @@ if args.data_path:
     data_path = args.data_path
 train_data, valid_data, test_data, vocabulary, reversed_dictionary = load_data()  # vocabulary is only the size
 if args.run_opt == 1:
-    train(train_data, vocabulary, num_layers=2, num_epochs=60, batch_size=20,
+    train(train_data, vocabulary, num_layers=2, num_epochs=100, batch_size=20,
           model_save_name='two-layer-lstm-medium-config-60-epoch-0p93-lr-decay-10-max-lr')
 else:
     trained_model = args.data_path + "\\two-layer-lstm-medium-config-60-epoch-0p93-lr-decay-10-max-lr-38"
