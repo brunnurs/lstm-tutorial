@@ -9,19 +9,24 @@ import datetime as dt
     from here: http://www.fit.vutbr.cz/~imikolov/rnnlm/simple-examples.tgz. Change the
     data_path variable below to your local exraction path"""
 
-data_path = "C:\\Users\Andy\Documents\simple-examples\data"
+data_path = "/home/ursin/development/eth_project/lstm-tutorial/data"
 
 parser = argparse.ArgumentParser()
 parser.add_argument('run_opt', type=int, default=1, help='An integer: 1 to train, 2 to test')
 parser.add_argument('--data_path', type=str, default=data_path, help='The full path of the training data')
 args = parser.parse_args()
 
+
 def read_words(filename):
     with tf.gfile.GFile(filename, "r") as f:
-        return f.read().decode("utf-8").replace("\n", "<eos>").split()
+        return f.read().replace("\n", "<eos>").split()
 
 
 def build_vocab(filename):
+    """
+    The idea of this method is to get the complete word-corpus and then give every word an ID. Words which often appear
+    should get small ID's
+    """
     data = read_words(filename)
 
     counter = collections.Counter(data)
@@ -34,6 +39,9 @@ def build_vocab(filename):
 
 
 def file_to_word_ids(filename, word_to_id):
+    """
+    Replace every word with it's ID (as decided in build_vocab())
+    """
     data = read_words(filename)
     return [word_to_id[word] for word in data if word in word_to_id]
 
@@ -67,8 +75,14 @@ def batch_producer(raw_data, batch_size, num_steps):
     data = tf.reshape(raw_data[0: batch_size * batch_len],
                       [batch_size, batch_len])
 
+    # before tf.reshape: raw_data = [2234, 32234, 34 ... 34534] <-- 929589 values
+    # after tf.reshape: data = [2234, 32234, 34 ... 34534]
+    #                          [3453, 45444, 55 ... 88636] <---- 46479 values x 20 batches (rows)
+
+    # epoch_size: how many steps (iterations) to go through all data once? batch_len divided by num_steps (35)
     epoch_size = (batch_len - 1) // num_steps
 
+    # extract the x and y data: always 35 per time and the y data shifted by 1 (see blog for an example)
     i = tf.train.range_input_producer(epoch_size, shuffle=False).dequeue()
     x = data[:, i * num_steps:(i + 1) * num_steps]
     x.set_shape([batch_size, num_steps])
@@ -82,6 +96,7 @@ class Input(object):
         self.batch_size = batch_size
         self.num_steps = num_steps
         self.epoch_size = ((len(data) // batch_size) - 1) // num_steps
+        # batch_producer() return x and y
         self.input_data, self.targets = batch_producer(data, batch_size, num_steps)
 
 
@@ -95,28 +110,40 @@ class Model(object):
         self.num_steps = input.num_steps
         self.hidden_size = hidden_size
 
-        # create the word embeddings
+        # create the word embeddings. We learn an embedding for each word in the vocabulary.
+        # The embedding-vector has a depth of hidden_size, which is arbitrary. We train the embeddings together with
+        # the overall-training, but in general we could also pre-train them.
         with tf.device("/cpu:0"):
             embedding = tf.Variable(tf.random_uniform([vocab_size, self.hidden_size], -init_scale, init_scale))
+            # lookup the input data in the embeddings --> inputs is afterwards the matching embedding to the x-data
             inputs = tf.nn.embedding_lookup(embedding, self.input_obj.input_data)
 
         if is_training and dropout < 1:
+            # this is a higher-level tensorflow operations (comparable with Keras) which adds a dropout for the
+            # whole inputs tensor. https://www.tensorflow.org/api_docs/python/tf/nn/dropout
             inputs = tf.nn.dropout(inputs, dropout)
 
-        # set up the state storage / extraction
+        # We want to load the final state of the learning on the previous batch when we begin with learning the next
+        # batch (the only exception is at the beginning of a new epoch - there we want to reset the state to 0).
+
+        # the size is   num_layers * the previous output from the cell h^t-1 *
+        #               previous state variable s^t-1 * batch-size * hidden_size
         self.init_state = tf.placeholder(tf.float32, [num_layers, 2, self.batch_size, self.hidden_size])
 
+        # bring the state (described above) to a proper LSTM-tuple format, one per layer
         state_per_layer_list = tf.unstack(self.init_state, axis=0)
         rnn_tuple_state = tuple(
             [tf.contrib.rnn.LSTMStateTuple(state_per_layer_list[idx][0], state_per_layer_list[idx][1])
              for idx in range(num_layers)]
         )
 
-        # create an LSTM cell to be unrolled
+        # create an LSTM cell to be unrolled. Important: in fact we create a lot more than just one LSTM-Cell,
+        # see https://jasdeep06.github.io/posts/Understanding-LSTM-in-Tensorflow-MNIST/
         cell = tf.contrib.rnn.LSTMCell(hidden_size, forget_bias=1.0)
         # add a dropout wrapper if training
         if is_training and dropout < 1:
             cell = tf.contrib.rnn.DropoutWrapper(cell, output_keep_prob=dropout)
+
         if num_layers > 1:
             cell = tf.contrib.rnn.MultiRNNCell([cell for _ in range(num_layers)], state_is_tuple=True)
 
@@ -148,7 +175,7 @@ class Model(object):
         self.accuracy = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))
 
         if not is_training:
-           return
+            return
         self.learning_rate = tf.Variable(0.0, trainable=False)
 
         tvars = tf.trainable_variables()
@@ -167,11 +194,11 @@ class Model(object):
         session.run(self.lr_update, feed_dict={self.new_lr: lr_value})
 
 
-def train(train_data, vocabulary, num_layers, num_epochs, batch_size, model_save_name,
+def train(train_data, vocabulary_size, num_layers, num_epochs, batch_size, model_save_name,
           learning_rate=1.0, max_lr_epoch=10, lr_decay=0.93, print_iter=50):
     # setup data and models
     training_input = Input(batch_size=batch_size, num_steps=35, data=train_data)
-    m = Model(training_input, is_training=True, hidden_size=650, vocab_size=vocabulary,
+    m = Model(training_input, is_training=True, hidden_size=650, vocab_size=vocabulary_size,
               num_layers=num_layers)
     init_op = tf.global_variables_initializer()
     orig_decay = lr_decay
@@ -199,7 +226,10 @@ def train(train_data, vocabulary, num_layers, num_epochs, batch_size, model_save
                     cost, _, current_state, acc = sess.run([m.cost, m.train_op, m.state, m.accuracy],
                                                            feed_dict={m.init_state: current_state})
                     print("Epoch {}, Step {}, cost: {:.3f}, accuracy: {:.3f}, Seconds per step: {:.3f}".format(epoch,
-                            step, cost, acc, seconds))
+                                                                                                               step,
+                                                                                                               cost,
+                                                                                                               acc,
+                                                                                                               seconds))
 
             # save a model checkpoint
             saver.save(sess, data_path + '\\' + model_save_name, global_step=epoch)
@@ -240,7 +270,7 @@ def test(model_path, test_data, reversed_dictionary):
                 acc, current_state = sess.run([m.accuracy, m.state], feed_dict={m.init_state: current_state})
             if batch >= acc_check_thresh:
                 accuracy += acc
-        print("Average accuracy: {:.3f}".format(accuracy / (num_acc_batches-acc_check_thresh)))
+        print("Average accuracy: {:.3f}".format(accuracy / (num_acc_batches - acc_check_thresh)))
         # close threads
         coord.request_stop()
         coord.join(threads)
@@ -248,11 +278,10 @@ def test(model_path, test_data, reversed_dictionary):
 
 if args.data_path:
     data_path = args.data_path
-train_data, valid_data, test_data, vocabulary, reversed_dictionary = load_data()
+train_data, valid_data, test_data, vocabulary, reversed_dictionary = load_data()  # vocabulary is only the size
 if args.run_opt == 1:
     train(train_data, vocabulary, num_layers=2, num_epochs=60, batch_size=20,
           model_save_name='two-layer-lstm-medium-config-60-epoch-0p93-lr-decay-10-max-lr')
 else:
     trained_model = args.data_path + "\\two-layer-lstm-medium-config-60-epoch-0p93-lr-decay-10-max-lr-38"
     test(trained_model, test_data, reversed_dictionary)
-
