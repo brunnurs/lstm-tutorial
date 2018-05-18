@@ -13,4 +13,5 @@ Interesting: [LSTM's and "hidden units"](https://stackoverflow.com/questions/379
 Interesting: [LSTM's and "hidden units - Part 2"](https://jasdeep06.github.io/posts/Understanding-LSTM-in-Tensorflow-MNIST/)
 
 Interesting: [Cross Entropy](https://stackoverflow.com/questions/41990250/what-is-cross-entropy)
+
 Interesting: [Cross Entropy vs. Softmax](https://www.quora.com/Is-the-softmax-loss-the-same-as-the-cross-entropy-loss/answer/Rafael-Pinto-4?share=4315878f&srid=3ibpF)
